@@ -10,492 +10,386 @@
 
 
 import datetime
-
-from idds.common.utils import setup_logging
-from idds.common.constants import (
-    RequestType,
-    RequestStatus,
-    RequestLocking,
-    TransformType,
-    TransformStatus,
-    ProcessingType,
-    ProcessingStatus,
-    CollectionType,
-    CollectionStatus,
-    CollectionRelationType,
-)
-from idds.core import requests as core_requests
-from idds.core import transforms as core_transforms
-from idds.core import catalog as core_catalog
-from idds.core import processings as core_processings
-from idds.orm.base.session import transactional_session
-
-from .panda import PandaClient
+import logging
 
 
-setup_logging(__name__)
+_logger = logging.getLogger(__name__)
 
 
-def get_scope_name(run_id, site, panda_attributes={}):
-    """Generate scope and name for a run."""
-    utc_now = datetime.datetime.now(datetime.timezone.utc)
-    year = utc_now.year
-    month = utc_now.month
-    day = utc_now.day
-    scope = f"EIC_{year}"
-    if site is None:
-        site = panda_attributes.get("site", None)
-    workflow_name = f"EIC_fastprocessing_{site}_{year}{month}{day}"
-    name = f"EIC_fastprocessing_{site}_{year}{month}{day}_{run_id}"
-    return scope, workflow_name, name
+# ---------------------------------------------------------------------------
+# Message builders
+# ---------------------------------------------------------------------------
 
-
-def get_task_parameters(
-    request_id,
-    transform_id=None,
-    name=None,
-    num_workers=None,
-    core_count=None,
-    ram_count=None,
-    site=None,
-    run_id=None,
-    panda_attributes={},
-):
+def _build_create_workflow_task_message(msg, panda_attributes, timetolive):
     """
-    Build PanDA task parameters.
+    Build a 'create_workflow_task' message dict and headers without publishing.
+
+    Returns (workflow_msg, headers).
     """
-    vo = panda_attributes.get("vo", "wlcg")
-    queue = panda_attributes.get("queue", None)
-    if site is None:
-        site = panda_attributes.get("site", None)
-    cloud = panda_attributes.get("cloud", None)
-    working_group = panda_attributes.get("working_group", None)
-    priority = panda_attributes.get("priority", 900)
-    if core_count is None:
-        core_count = panda_attributes.get("core_count", 1)
-    if ram_count is None:
-        ram_count = panda_attributes.get("ram_count", 4000)
-    if num_workers is None:
-        num_workers = panda_attributes.get("num_workers", 1)
-    max_walltime = panda_attributes.get("max_walltime", 3600)
-    max_attempt = panda_attributes.get("max_attempt", 3)
-    idle_timeout = panda_attributes.get("idle_timeout", 120)
+    run_id = msg.get("run_id")
+    content = msg.get("content", {})
 
-    task_param_map = {}
-    task_param_map["vo"] = vo
-    if queue:
-        task_param_map["site"] = queue
-    if site:
-        task_param_map["PandaSite"] = site
-    if cloud:
-        task_param_map["cloud"] = cloud
+    now = datetime.datetime.now(datetime.timezone.utc)
+    year = now.strftime("%Y")
+    month = now.strftime("%m")
+    day = now.strftime("%d")
 
-    if working_group:
-        task_param_map["workingGroup"] = working_group
+    site = content.get("site") or panda_attributes.get("site", "")
+    scope = panda_attributes.get("scope", f"EIC_{year}")
+    transform_tag = panda_attributes.get("transform_tag", "")
 
-    task_param_map["taskName"] = name
-    task_param_map["userName"] = "iDDS"
-    task_param_map["taskPriority"] = priority
-    task_param_map["architecture"] = ""
-    # task_param_map['architecture'] = '@el9'
-    task_param_map["transUses"] = ""
-    task_param_map["transHome"] = None
+    workflow = {
+        "scope": scope,
+        "name": f"{scope}_{transform_tag}_fastprocessing_{site}_{year}{month}{day}",
+        "requester": panda_attributes.get("username", ""),
+        "username": panda_attributes.get("username", ""),
+        "transform_tag": transform_tag,
+        "cloud": panda_attributes.get("cloud", ""),
+        "campaign": panda_attributes.get("campaign", ""),
+        "campaign_scope": f"{panda_attributes.get('campaign', '')}_{year}",
+        "campaign_group": f"{panda_attributes.get('campaign', '')}_{year}_{month}",
+        "campaign_tag": panda_attributes.get("campaign_tag", ""),
+    }
 
-    executable = f"--run_id {run_id} --idle_timeout {idle_timeout}"
-    task_param_map["transPath"] = (
-        "https://storage.googleapis.com/drp-us-central1-containers/run_prompt_wrapper"
-    )
-
-    task_param_map["processingType"] = None
-    task_param_map["prodSourceLabel"] = "managed"  # managed, test, ptest
-
-    # task_param_map['noWaitParent'] = True
-    task_param_map["taskType"] = "iDDS"
-    task_param_map["coreCount"] = core_count
-    task_param_map["skipScout"] = True
-    task_param_map["ramCount"] = ram_count
-    # task_param_map['ramUnit'] = 'MB'
-    task_param_map["ramUnit"] = "MBPerCoreFixed"
-
-    # task_param_map['inputPreStaging'] = True
-    task_param_map["prestagingRuleID"] = 123
-    task_param_map["nChunksToWait"] = 1
-    task_param_map["maxCpuCount"] = core_count
-    task_param_map["maxWalltime"] = max_walltime
-    task_param_map["maxFailure"] = max_attempt
-    task_param_map["maxAttempt"] = max_attempt
-
-    task_param_map["jobParameters"] = [
-        {
-            "type": "constant",
-            "value": executable,  # noqa: E501
+    workflow_msg = {
+        "msg_type": "create_workflow_task",
+        "run_id": run_id,
+        "created_at": now.isoformat(),
+        "content": {
+            **content,
+            "run_id": run_id,
+            "created_at": now.isoformat(),
+            "core_count": content.get("num_cores_per_worker") or content.get("core_count"),
+            "memory_per_core": content.get("num_ram_per_core") or content.get("memory_per_core"),
+            "site": site,
+            "panda_attributes": panda_attributes,
+            "workflow": workflow,
         },
-    ]
+    }
 
-    in_files = [f"{run_id}"]
-    task_param_map["nFiles"] = len(in_files)
-    task_param_map["noInput"] = True
-    task_param_map["pfnList"] = in_files
-    task_param_map["nFilesPerJob"] = 1
+    headers = {
+        "persistent": "true",
+        "ttl": timetolive,
+        "vo": "eic",
+        "msg_type": "create_workflow_task",
+        "run_id": str(run_id),
+    }
 
-    task_param_map["nEvents"] = num_workers
-    task_param_map["nEventsPerJob"] = 1
-
-    task_param_map["reqID"] = request_id
-
-    return task_param_map
+    return workflow_msg, headers
 
 
-def submit_task_to_panda(
-    request_id,
-    transform_id=None,
-    name=None,
-    num_workers=None,
-    core_count=None,
-    ram_count=None,
-    site=None,
-    run_id=None,
+def _build_adjust_worker_message(msg, idds_ids, timetolive):
+    """
+    Build an 'adjust_worker' message dict and headers without publishing.
+
+    Returns (adjust_msg, headers).
+    """
+    run_id = msg.get("run_id")
+    content = msg.get("content", {})
+    idds_ids = idds_ids or {}
+
+    adjust_msg = {
+        "msg_type": "adjust_worker",
+        "run_id": run_id,
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "content": {
+            "run_id": run_id,
+            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "request_id": idds_ids.get("request_id"),
+            "transform_id": idds_ids.get("transform_id"),
+            "workload_id": idds_ids.get("workload_id"),
+            "core_count": content.get("core_count") or content.get("num_cores_per_worker"),
+            "memory_per_core": content.get("memory_per_core") or content.get("num_ram_per_core"),
+            "site": content.get("site"),
+        },
+    }
+
+    headers = {
+        "persistent": "true",
+        "ttl": timetolive,
+        "vo": "eic",
+        "msg_type": "adjust_worker",
+        "run_id": str(run_id),
+    }
+
+    return adjust_msg, headers
+
+
+def _build_close_workflow_task_message(idds_ids, run_id, timetolive):
+    """
+    Build a 'close_workflow_task' message dict and headers without publishing.
+
+    Returns (close_msg, headers).
+    """
+    idds_ids = idds_ids or {}
+
+    close_msg = {
+        "msg_type": "close_workflow_task",
+        "run_id": run_id,
+        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "content": {
+            "run_id": run_id,
+            "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "request_id": idds_ids.get("request_id"),
+            "transform_id": idds_ids.get("transform_id"),
+            "workload_id": idds_ids.get("workload_id"),
+        },
+    }
+
+    headers = {
+        "persistent": "true",
+        "ttl": timetolive,
+        "vo": "eic",
+        "msg_type": "close_workflow_task",
+        "run_id": str(run_id),
+    }
+
+    return close_msg, headers
+
+
+# ---------------------------------------------------------------------------
+# Publishers
+# ---------------------------------------------------------------------------
+
+def publish_create_workflow_task_message(
+    msg,
+    idds_workflow_publisher,
+    timetolive=12 * 3600 * 1000,
     panda_attributes={},
     logger=None,
 ):
     """
-    Submit a task to Panda for processing.
-    """
-
-    # Submit the task to Panda
-    panda_client = PandaClient()
-    task_parameters = get_task_parameters(
-        request_id,
-        transform_id=transform_id,
-        name=name,
-        num_workers=num_workers,
-        core_count=core_count,
-        ram_count=ram_count,
-        site=site,
-        run_id=run_id,
-        panda_attributes=panda_attributes,
-    )
-    task_id = panda_client.submit(
-        task_parameters, logger=logger, log_prefix=f"[run_id={run_id}] "
-    )
-    if logger:
-        logger.info(f"Submitted PanDA task {task_id} for run_id={run_id}")
-    return task_id
-
-
-def close_panda_task(task_id, logger=None):
-    """
-    Close a PanDA task to prevent further job retries.
-    """
-    panda_client = PandaClient()
-    ret = panda_client.close(task_id, soft=True)
-    if logger:
-        logger.info(f"Finished PanDA task {task_id} with return code: {ret}")
-
-
-@transactional_session
-def create_workflow_task(message, panda_attributes={}, logger=None, session=None):
-    """
-    Create a workflow task in iDDS when receiving 'run_imminent' message.
+    Publish a 'create_workflow_task' message to /topic/idds.workflow so that
+    the iDDS agent creates the iDDS workflow and PanDA task asynchronously.
 
     Message format:
     {
-      'msg_type': 'run_imminent',
-      'run_id': 20250914185722,
-      'created_at': datetime.datetime.utcnow(),
+      'msg_type': 'create_workflow_task',
+      'run_id': <run_id>,
+      'created_at': <utcnow>,
       'content': {
-        'num_workers': 2,
-        'num_cores_per_worker': 10,
-        'num_ram_per_core': 4000.0,  # MB
-        ...
+          'run_id': ...,
+          'core_count': ...,
+          'memory_per_core': ...,
+          'site': ...,
+          'panda_attributes': {...},
+          'workflow': {
+              'scope': ...,
+              'name': ...,
+              'requester': ...,
+              'username': ...,
+              'transform_tag': ...,
+              'cloud': ...,
+              'campaign': ...,
+              'campaign_scope': ...,
+              'campaign_group': ...,
+              'campaign_tag': ...,
+          }
       }
     }
-
-    Returns: (request_id, transform_id, processing_id, coll_id, workload_id)
     """
-    run_id = message.get("run_id")
-    content = message.get("content", {})
+    logger = logger or _logger
+    run_id = msg.get("run_id")
+    workflow_msg, headers = _build_create_workflow_task_message(msg, panda_attributes, timetolive)
 
-    # Extract resource requirements from message
-    num_workers = content.get("target_worker_count", 1)
-    core_count = content.get("num_cores_per_worker", None)
-    ram_count = content.get("num_ram_per_core", None)
-    site = content.get("site", None)
-
-    utc_now = datetime.datetime.now(datetime.timezone.utc)
-    year = utc_now.year
-    month = utc_now.month
-
-    scope, workflow_name, name = get_scope_name(run_id, site, panda_attributes)
-    reqs = core_requests.get_request_ids_by_name(
-        scope=scope, name=workflow_name, exact_match=True, session=session
-    )
-
-    if reqs:
-        request_id = reqs[workflow_name]
+    if idds_workflow_publisher:
+        idds_workflow_publisher.publish(workflow_msg, headers=headers)
+        if logger:
+            logger.info(
+                f"Published create_workflow_task to /topic/idds.workflow for run_id={run_id}"
+            )
     else:
-        workflow = {
-            "scope": scope,
-            "name": workflow_name,
-            "requester": "iDDS",
-            "request_type": RequestType.iWorkflow,
-            "username": "EIC",
-            "transform_tag": "EIC",
-            "status": RequestStatus.Transforming,
-            "locking": RequestLocking.Idle,
-            "cloud": "US",
-            "campaign": "EIC",
-            "campaign_scope": f"EIC_{year}",
-            "campaign_group": f"EIC_{year}_{month}",
-            "campaign_tag": "reco",
-        }
-        request_id = core_requests.add_request(**workflow, session=session)
-
-    transform = {
-        "request_id": request_id,
-        "workload_id": None,
-        "transform_type": TransformType.iWork,
-        "transform_tag": "EIC",
-        "name": name,
-        "status": TransformStatus.New,
-        "substatus": TransformStatus.New,
-    }
-    transform_id = core_transforms.add_transform(**transform, session=session)
-
-    input_coll = {
-        "request_id": request_id,
-        "transform_id": transform_id,
-        "workload_id": None,
-        "scope": scope,
-        "name": name,
-        'coll_type': CollectionType.Dataset,
-        'relation_type': CollectionRelationType.Input,
-        'bytes': 0,
-        'total_files': 0,
-        'new_files': 0,
-        'processed_files': 0,
-        'processing_files': 0,
-        'coll_metadata': None,
-        'status': CollectionStatus.Closed,
-    }
-    output_coll = {
-        "request_id": request_id,
-        "transform_id": transform_id,
-        "workload_id": None,
-        "scope": scope,
-        "name": name,
-        'coll_type': CollectionType.Dataset,
-        'relation_type': CollectionRelationType.Output,
-        'bytes': 0,
-        'total_files': 0,
-        'new_files': 0,
-        'processed_files': 0,
-        'processing_files': 0,
-        'coll_metadata': None,
-        'status': CollectionStatus.Closed,
-    }
-    input_coll_id = core_catalog.add_collection(**input_coll, session=session)
-    output_coll_id = core_catalog.add_collection(**output_coll, session=session)
-
-    # For now, return a placeholder workload_id
-    # In production, this should call submit_task_to_panda()
-    workload_id = submit_task_to_panda(
-        request_id,
-        transform_id=transform_id,
-        name=name,
-        num_workers=num_workers,
-        core_count=core_count,
-        ram_count=ram_count,
-        site=site,
-        run_id=run_id,
-        panda_attributes=panda_attributes,
-        logger=logger,
-    )
-
-    processing = {
-        "request_id": request_id,
-        "transform_id": transform_id,
-        "workload_id": workload_id,
-        "status": ProcessingStatus.Submitting,
-        "submitter": "panda",
-        "site": site,
-        "processing_type": ProcessingType.iWork,
-    }
-    processing_id = core_processings.add_processing(**processing, session=session)
-
-    if logger:
-        logger.info(
-            f"Created workflow task: request_id={request_id}, transform_id={transform_id}, "
-            f"processing_id={processing_id}, workload_id={workload_id}"
-        )
-
-    return request_id, transform_id, processing_id, input_coll_id, output_coll_id, workload_id
+        if logger:
+            logger.error(
+                f"idds_workflow_publisher not available; "
+                f"cannot send create_workflow_task for run_id={run_id}"
+            )
 
 
-def create_harvester_worker(
-    header,
+def publish_adjust_worker_message(
     msg,
-    task_id,
-    harvester_publisher,
+    idds_workflow_publisher,
+    idds_ids=None,
     timetolive=12 * 3600 * 1000,
-    panda_attributes={},
     logger=None,
 ):
     """
-    Send message to harvester to create workers.
+    Publish an 'adjust_worker' message to /topic/idds.workflow.
 
-    Message format based on prompt.md:
+    Message format:
     {
-      'msg_type': 'adjuster_worker',
-      'run_id': 20250914185722,
-      'created_at': datetime.datetime.utcnow(),
+      'msg_type': 'adjust_worker',
+      'run_id': <run_id>,
+      'created_at': <utcnow>,
       'content': {
-        'num_workers': 2,
-        'num_cores_per_worker': 10,
-        'num_ram_per_core': 4000.0,
-        'requested_at': <original message created_at>
+          'run_id': ...,
+          'created_at': ...,
+          'request_id': ...,
+          'transform_id': ...,
+          'workload_id': ...,
+          'core_count': ...,
+          'memory_per_core': ...,
+          'site': ...,
       }
     }
     """
-    content = msg.get("content", {})
+    logger = logger or _logger
     run_id = msg.get("run_id")
-    panda_queue = panda_attributes.get("queue", None)
-    created_at_original = msg.get("created_at")
+    adjust_msg, headers = _build_adjust_worker_message(msg, idds_ids, timetolive)
 
-    worker_msg = {
-        "msg_type": "adjuster_worker",
-        "run_id": run_id,
-        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "content": {
-            "num_workers": content.get("num_workers", 1),
-            "num_cores_per_worker": content.get("num_cores_per_worker", 1),
-            "num_ram_per_core": content.get("num_ram_per_core", 1000),
-            "panda_queue": panda_queue,
-            "requested_at": created_at_original,
-        },
-    }
-
-    msg_header = {
-        "persistent": "true",
-        "ttl": timetolive,
-        "vo": "eic",
-        "msg_type": "adjuster_worker",
-        "run_id": str(run_id),
-    }
-
-    if harvester_publisher:
-        harvester_publisher.publish(worker_msg, headers=msg_header)
-
+    if idds_workflow_publisher:
+        idds_workflow_publisher.publish(adjust_msg, headers=headers)
         if logger:
             logger.info(
-                f"Sent adjuster_worker message for run_id={run_id}, task_id={task_id}, num_workers={worker_msg['content']['num_workers']}"
+                f"Published adjust_worker to /topic/idds.workflow for run_id={run_id}"
+            )
+    else:
+        if logger:
+            logger.error(
+                f"idds_workflow_publisher not available; "
+                f"cannot send adjust_worker for run_id={run_id}"
             )
 
 
-def stop_harvester_worker(
-    header,
-    msg,
-    task_id,
-    harvester_publisher,
-    transformer_broadcaster,
+def publish_close_workflow_task_message(
+    idds_ids,
+    idds_workflow_publisher,
+    run_id=None,
     timetolive=12 * 3600 * 1000,
-    panda_attributes={},
     logger=None,
 ):
     """
-    Stop harvester workers when receiving 'run_end' message.
+    Publish a 'close_workflow_task' message to /topic/idds.workflow so that
+    the iDDS agent closes the workflow and PanDA task.
 
-    Based on prompt.md:
-    1. Close PanDA task to avoid retrying jobs
-    2. Send worker adjuster message to stop creating new workers
-    3. Broadcast stop message to all transformers
-
-    Message formats:
-    - adjuster_worker: Stop creating new workers
-    - stop_transformer: Broadcast to all transformers to stop
+    Message format:
+    {
+      'msg_type': 'close_workflow_task',
+      'run_id': <run_id>,
+      'created_at': <utcnow>,
+      'content': {
+          'request_id': ...,
+          'transform_id': ...,
+          'workload_id': ...,
+      }
+    }
     """
-    # content = msg.get("content", {})
-    run_id = msg.get("run_id")
-    panda_queue = panda_attributes.get("queue", None)
-    created_at_original = msg.get("created_at")
+    logger = logger or _logger
+    close_msg, headers = _build_close_workflow_task_message(idds_ids, run_id, timetolive)
 
-    # TODO: Close PanDA task
-    # close_panda_task(task_id)
-
-    # Send stop message to transformers (broadcast)
-    stop_transformer_msg = {
-        "msg_type": "stop_transformer",
-        "run_id": run_id,
-        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-        "content": {"task_id": task_id, "requested_at": created_at_original},
-    }
-
-    stop_header = {
-        "persistent": "true",
-        "ttl": timetolive,
-        "vo": "eic",
-        "msg_type": "stop_transformer",
-        "run_id": str(run_id),
-    }
-
-    if transformer_broadcaster:
-        transformer_broadcaster.publish(stop_transformer_msg, headers=stop_header)
+    if idds_workflow_publisher:
+        idds_workflow_publisher.publish(close_msg, headers=headers)
         if logger:
             logger.info(
-                f"Sent stop_transformer broadcast for run_id={run_id}, task_id={task_id}"
+                f"Published close_workflow_task to /topic/idds.workflow for run_id={run_id}, "
+                f"request_id={close_msg['content'].get('request_id')}, "
+                f"transform_id={close_msg['content'].get('transform_id')}, "
+                f"workload_id={close_msg['content'].get('workload_id')}"
+            )
+    else:
+        if logger:
+            logger.error(
+                f"idds_workflow_publisher not available; "
+                f"cannot send close_workflow_task for run_id={run_id}"
             )
 
-    # Send message to stop creating new workers
-    stop_worker_msg = {
-        "msg_type": "adjuster_worker",
+
+# ---------------------------------------------------------------------------
+# Handlers
+# ---------------------------------------------------------------------------
+
+def handle_slice_result(msg, idds_ids, handler_kwargs, timetolive, logger):
+    """
+    Handle a 'slice_result' message: scale up workers if actual processing time
+    exceeds the configured threshold by 20 % (scale 1.2×) or 50 % (scale 1.5×).
+
+    Reads/updates core_count from handler_kwargs['core_count_cache'][run_id].
+    Configured threshold comes from handler_kwargs['slice_config']['processing_time']
+    (default 30 s).
+    """
+    logger = logger or _logger
+    run_id = msg.get("run_id")
+    content = msg.get("content", {})
+    actual_time = content.get("processing_time")
+
+    slice_cfg = handler_kwargs.get("slice_config", {})
+    config_time = slice_cfg.get("processing_time", 30)
+
+    core_count_cache = handler_kwargs.get("core_count_cache", {})
+    current_core_count = core_count_cache.get(run_id)
+
+    if actual_time is None or current_core_count is None:
+        if logger:
+            logger.warning(
+                f"slice_result: cannot scale workers for run_id={run_id}; "
+                f"actual_time={actual_time}, cached core_count={current_core_count}"
+            )
+        return
+
+    if actual_time > config_time * 1.5:
+        scale = 1.5
+    elif actual_time > config_time * 1.2:
+        scale = 1.2
+    else:
+        if logger:
+            logger.info(
+                f"slice_result: processing_time={actual_time}s within threshold "
+                f"({config_time}s) for run_id={run_id}, no scaling needed"
+            )
+        return
+
+    new_core_count = int(current_core_count * scale)
+    core_count_cache[run_id] = new_core_count
+
+    adjusted_msg = {
         "run_id": run_id,
-        "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "content": {
-            "num_workers": 0,  # Stop creating new workers
-            "num_cores_per_worker": 0,
-            "num_ram_per_core": 0,
-            "panda_queue": panda_queue,
-            "requested_at": created_at_original,
+            "core_count": new_core_count,
+            "site": content.get("site"),
         },
     }
 
-    worker_header = {
-        "persistent": "true",
-        "ttl": timetolive,
-        "vo": "eic",
-        "msg_type": "adjuster_worker",
-        "run_id": str(run_id),
-    }
+    mode = handler_kwargs.get("mode", "message")
+    idds_workflow_publisher = handler_kwargs.get("idds_workflow_publisher")
+    panda_client = handler_kwargs.get("panda_client")
 
-    if harvester_publisher:
-        harvester_publisher.publish(stop_worker_msg, headers=worker_header)
-        if logger:
-            logger.info(
-                f"Sent adjuster_worker (stop) message for run_id={run_id}, task_id={task_id}"
+    adjust_msg, headers = _build_adjust_worker_message(adjusted_msg, idds_ids, timetolive)
+    if mode == "message":
+        if idds_workflow_publisher:
+            idds_workflow_publisher.publish(adjust_msg, headers=headers)
+        else:
+            logger.error(
+                f"idds_workflow_publisher not available; "
+                f"cannot send adjust_worker for run_id={run_id}"
             )
+    else:
+        panda_client.idds_adjust_worker(adjust_msg["content"], logger=logger)
+
+    logger.info(
+        f"slice_result: scaled workers by {scale}x for run_id={run_id}, "
+        f"core_count: {current_core_count} -> {new_core_count} "
+        f"(actual_time={actual_time}s, threshold={config_time}s)"
+    )
 
 
-def worker_handler(header, msg, task_id=None, handler_kwargs={}, logger=None):
+def worker_handler(_header, msg, idds_ids=None, handler_kwargs={}, logger=None):
     """
-    Handle worker-related messages based on prompt.md specifications.
+    Handle worker-related messages.
 
     Supported message types:
-    - run_imminent: Create workflow task and start workers
-    - run_end/run_stop: Stop workers and transformers
+    - run_imminent: Publish create_workflow_task to /topic/idds.workflow
+    - created_workflow_task: Return iDDS IDs; publish adjust_worker to /topic/idds.workflow
+    - run_end/run_stop/end_run: Broadcast stop to transformers; publish close_workflow_task
+    - slice_result: Scale up workers if processing_time exceeds threshold
     - transformer_heartbeat: Track transformer health
 
-    :param header: Message header (should contain 'run_id')
-    :param msg: Message content with format:
-                {
-                  'msg_type': '<type>',
-                  'run_id': 20250914185722,
-                  'created_at': datetime,
-                  'content': {...}
-                }
-    :param task_id: Task ID (may be None for run_imminent)
-    :param handler_kwargs: Dictionary of handler keyword arguments
-    :return: Dictionary with task_id if created
+    :param header: Message header
+    :param msg: Message body
+    :param idds_ids: Dict with request_id, transform_id, workload_id (required for run_end)
+    :param handler_kwargs: Handler configuration
+    :return: Dict with run_id, request_id, transform_id, workload_id if created_workflow_task
     """
+    logger = logger or _logger
     ret = {}
     msg_type = msg.get("msg_type")
     run_id = msg.get("run_id")
@@ -504,53 +398,108 @@ def worker_handler(header, msg, task_id=None, handler_kwargs={}, logger=None):
     panda_attributes = {}
 
     transformer_broadcaster = handler_kwargs.get("transformer_broadcaster", None)
-    worker_publisher = handler_kwargs.get("worker_publisher", None)
+    idds_workflow_publisher = handler_kwargs.get("idds_workflow_publisher", None)
     timetolive = handler_kwargs.get("timetolive", timetolive)
     panda_attributes = handler_kwargs.get("panda_attributes", panda_attributes)
+    mode = handler_kwargs.get("mode", "message")
+    panda_client = handler_kwargs.get("panda_client", None)
+
+    if mode not in ("message", "rest"):
+        raise ValueError(
+            f"Invalid transceiver mode: {mode!r}. Must be 'message' or 'rest'"
+        )
 
     try:
         if msg_type == "run_imminent":
-            # Create workflow task and workers
-            request_id, transform_id, processing_id, input_coll_id, output_coll_id, workload_id = (
-                create_workflow_task(msg, panda_attributes=panda_attributes)
+            workflow_msg, headers = _build_create_workflow_task_message(
+                msg, panda_attributes, timetolive
             )
-            task_id = workload_id
-            create_harvester_worker(
-                header,
-                msg,
-                task_id,
-                worker_publisher,
-                timetolive=timetolive,
-                panda_attributes=panda_attributes,
-                logger=logger,
+            if mode == "message":
+                if idds_workflow_publisher:
+                    idds_workflow_publisher.publish(workflow_msg, headers=headers)
+                    logger.info(
+                        f"Published create_workflow_task to /topic/idds.workflow for run_id={run_id}"
+                    )
+                else:
+                    logger.error(
+                        f"idds_workflow_publisher not available; "
+                        f"cannot send create_workflow_task for run_id={run_id}"
+                    )
+            else:
+                content = workflow_msg["content"]
+                workflow = content["workflow"]
+                rest_content = {k: v for k, v in content.items() if k != "workflow"}
+                panda_client.idds_create_workflow_task(workflow, rest_content, logger=logger)
+            logger.info(f"Handled run_imminent: run_id={run_id}")
+
+        elif msg_type == "created_workflow_task":
+            content = msg.get("content", {})
+            request_id = content.get("request_id")
+            transform_id = content.get("transform_id")
+            workload_id = content.get("workload_id")
+            ret = {
+                "run_id": run_id,
+                "request_id": request_id,
+                "transform_id": transform_id,
+                "workload_id": workload_id,
+            }
+            logger.info(
+                f"Handled created_workflow_task: run_id={run_id}, "
+                f"request_id={request_id}, transform_id={transform_id}, workload_id={workload_id}"
             )
-            ret["task_id"] = task_id
-            if logger:
-                logger.info(f"Handled run_imminent: run_id={run_id}, task_id={task_id}")
 
         elif msg_type in ["run_end", "run_stop", "end_run"]:
-            # Close PanDA task
-            ## close_panda_task(task_id, logger=logger)
-            # Stop workers and transformers
-            stop_harvester_worker(
-                header,
+            created_at_original = msg.get("created_at")
+            if transformer_broadcaster:
+                stop_msg = {
+                    "msg_type": "stop_transformer",
+                    "run_id": run_id,
+                    "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                    "content": {"requested_at": created_at_original},
+                }
+                stop_header = {
+                    "persistent": "true",
+                    "ttl": timetolive,
+                    "vo": "eic",
+                    "msg_type": "stop_transformer",
+                    "run_id": str(run_id),
+                }
+                transformer_broadcaster.publish(stop_msg, headers=stop_header)
+                logger.info(f"Sent stop_transformer broadcast for run_id={run_id}")
+
+            close_msg, headers = _build_close_workflow_task_message(idds_ids, run_id, timetolive)
+            if mode == "message":
+                if idds_workflow_publisher:
+                    idds_workflow_publisher.publish(close_msg, headers=headers)
+                    logger.info(
+                        f"Published close_workflow_task to /topic/idds.workflow for run_id={run_id}"
+                    )
+                else:
+                    logger.error(
+                        f"idds_workflow_publisher not available; "
+                        f"cannot send close_workflow_task for run_id={run_id}"
+                    )
+            else:
+                panda_client.idds_close_workflow_task(close_msg["content"], logger=logger)
+            logger.info(f"Handled {msg_type}: run_id={run_id}")
+
+        elif msg_type == "slice_result":
+            handle_slice_result(
                 msg,
-                task_id,
-                worker_publisher,
-                transformer_broadcaster,
-                timetolive=timetolive,
-                panda_attributes=panda_attributes,
-                logger=logger,
+                idds_ids,
+                handler_kwargs,
+                timetolive,
+                logger,
             )
-            if logger:
-                logger.info(f"Handled {msg_type}: run_id={run_id}, task_id={task_id}")
+            logger.info(f"Handled slice_result: run_id={run_id}")
 
         elif msg_type == "transformer_heartbeat":
             transformer_id = msg.get("content", {}).get("id")
             hostname = msg.get("content", {}).get("hostname")
             if logger:
                 logger.info(
-                    f"Transformer heartbeat: run_id={run_id}, transformer_id={transformer_id}, hostname={hostname}"
+                    f"Transformer heartbeat: run_id={run_id}, "
+                    f"transformer_id={transformer_id}, hostname={hostname}"
                 )
 
         else:

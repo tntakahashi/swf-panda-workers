@@ -1,0 +1,378 @@
+#!/usr/bin/env python
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# You may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# http://www.apache.org/licenses/LICENSE-2.0OA
+#
+# Authors:
+# - Wen Guan, <wen.guan@cern.ch>, 2025
+
+"""
+Prompt Transceiver Agent
+
+This agent receives and processes messages from the SWF Processing Agent
+and manages workflow tasks, workers, and transformers.
+
+Message Format Specification:
+See main/prompt.md for complete message format specifications.
+
+All messages should contain:
+- 'msg_type': Type of message ('run_imminent', 'created_workflow_task', 'run_stop', etc.)
+- 'run_id': Unique run identifier (e.g., 20250914185722)
+- 'created_at': Timestamp when message was created
+- 'content': Message-specific content
+
+Headers should contain:
+- 'persistent': 'true'
+- 'ttl': Time to live in milliseconds (default: 12 * 3600 * 1000)
+- 'vo': 'eic'
+- 'instance': 'dev', 'prod', etc.
+- 'msg_type': Message type
+- 'run_id': Run identifier
+"""
+
+import logging
+import os
+import signal
+import sys
+import threading
+import traceback
+
+import yaml
+from cachetools import TTLCache
+
+from .brokers.activemq import Publisher, Subscriber
+from .prompt.handlers.panda import PandaClient
+from .prompt.handlers.workerhandler import worker_handler
+
+VALID_MODES = ("message", "rest")
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_CONFIG_NAME = "swf_panda_workers.yaml"
+
+
+def load_config(config_path=None):
+    """
+    Load configuration from a YAML file.
+
+    Search order (first existing file wins):
+      1. ``config_path`` argument
+      2. ``$SWF_PANDA_WORKERS_CONFIG`` environment variable
+      3. ``~/.config/swf_panda_workers/swf_panda_workers.yaml``
+      4. ``$PREFIX/etc/swf_panda_workers/swf_panda_workers.yaml``  (installed)
+      5. ``<repo>/config/swf_panda_workers.yaml``                  (development)
+
+    ``${VAR}`` placeholders in the file are expanded via :func:`os.path.expandvars`.
+    """
+    candidates = [
+        config_path,
+        os.environ.get("SWF_PANDA_WORKERS_CONFIG"),
+        os.path.expanduser(f"~/.config/swf_panda_workers/{_DEFAULT_CONFIG_NAME}"),
+        os.path.join(sys.prefix, "etc", "swf_panda_workers", _DEFAULT_CONFIG_NAME),
+        os.path.join(os.path.dirname(__file__), "..", "..", "config", _DEFAULT_CONFIG_NAME),
+    ]
+
+    resolved = None
+    for candidate in candidates:
+        if candidate and os.path.isfile(candidate):
+            resolved = os.path.abspath(candidate)
+            break
+
+    if resolved is None:
+        raise FileNotFoundError(
+            f"Config file '{_DEFAULT_CONFIG_NAME}' not found. "
+            f"Set SWF_PANDA_WORKERS_CONFIG or pass --config."
+        )
+
+    logger.info(f"Loading config from {resolved}")
+    with open(resolved) as fh:
+        content = os.path.expandvars(fh.read())
+    return yaml.safe_load(content)
+
+
+class Transceiver:
+    """
+    Standalone transceiver agent for SWF Panda Workers.
+
+    Receives workflow management messages on /topic/panda.workers and
+    coordinates workflow creation, worker scaling, and transformer lifecycle
+    via /topic/idds.workflow and /topic/panda.transformer.
+
+    Message flow:
+      a. EIC          -> 'run_imminent'          -> /topic/panda.workers
+      b. Transceiver  -> 'create_workflow_task'  -> /topic/idds.workflow
+      c. iDDS         -> 'created_workflow_task' -> /topic/panda.workers
+      d. Transceiver  -> 'adjust_worker'         -> /topic/idds.workflow
+      e. Transformer  -> 'transformer_heartbeat' -> /topic/panda.workers
+      f. EIC          -> 'run_end'               -> /topic/panda.workers
+      g. Transceiver  -> 'stop_transformer'      -> /topic/panda.transformer  (broadcast)
+      h. Transceiver  -> 'adjust_worker' (0)     -> /topic/idds.workflow
+    """
+
+    def __init__(
+        self,
+        namespace=None,
+        num_threads=8,
+        timetolive=12 * 3600 * 1000,
+        transformer_broadcast_broker=None,
+        worker_subscriber_broker=None,
+        idds_workflow_publisher_broker=None,
+        panda_attributes=None,
+        slice_config=None,
+        mode="message",
+    ):
+        if mode not in VALID_MODES:
+            raise ValueError(
+                f"Invalid transceiver mode: {mode!r}. Must be one of {VALID_MODES}"
+            )
+        self.logger = logging.getLogger(__name__)
+        self.namespace = namespace
+        self.num_threads = num_threads
+        self.timetolive = timetolive
+        self.transformer_broadcast_broker = transformer_broadcast_broker
+        self.worker_subscriber_broker = worker_subscriber_broker
+        self.idds_workflow_publisher_broker = idds_workflow_publisher_broker
+        self.panda_attributes = panda_attributes or {}
+        self.slice_config = slice_config or {}
+        self.mode = mode
+
+        self.graceful_stop = threading.Event()
+        self._lock = threading.RLock()
+
+        # Cache: run_id -> {run_id, request_id, transform_id, workload_id}, expiration 3 days
+        self.run_to_idds_ids_cache = TTLCache(maxsize=200, ttl=3600 * 24 * 3)
+        # Cache: run_id -> current core_count, expiration 3 days
+        self.run_to_core_count_cache = TTLCache(maxsize=200, ttl=3600 * 24 * 3)
+
+    def get_run_id(self, msg):
+        """Get run_id from message."""
+        return msg.get("run_id", None)
+
+    def cache_idds_ids(self, msg, idds_ids):
+        """Cache {request_id, transform_id, workload_id} for a given run_id."""
+        run_id = self.get_run_id(msg)
+        if run_id:
+            self.run_to_idds_ids_cache[run_id] = idds_ids
+            self.logger.debug(f"Cached idds_ids={idds_ids} for run_id={run_id}")
+
+    def get_idds_ids_from_cache(self, msg):
+        """Retrieve cached {request_id, transform_id, workload_id} for a given run_id."""
+        run_id = self.get_run_id(msg)
+        idds_ids = self.run_to_idds_ids_cache.get(run_id, None)
+        if not idds_ids:
+            self.logger.warning(f"No cached idds_ids found for run_id={run_id}")
+        return idds_ids
+
+    def on_message(self, header, msg, handler_kwargs={}):
+        """
+        Dispatch incoming messages from /topic/panda.workers.
+
+        Supported message types:
+        - 'run_imminent':          publish create_workflow_task to /topic/idds.workflow
+        - 'created_workflow_task': cache iDDS IDs; publish adjust_worker
+        - 'run_end' / 'run_stop':  broadcast stop_transformer; publish adjust_worker (0)
+        - 'transformer_heartbeat': log heartbeat
+        """
+        msg_type = msg.get("msg_type")
+        run_id = msg.get("run_id")
+
+        self.logger.debug(f"Received message: msg_type={msg_type}, run_id={run_id}")
+
+        try:
+            if msg_type == "run_imminent":
+                content = msg.get("content", {})
+                core_count = content.get("num_cores_per_worker") or content.get("core_count")
+                if core_count and run_id:
+                    self.run_to_core_count_cache[run_id] = core_count
+                worker_handler(header, msg, None, handler_kwargs, logger=self.logger)
+            elif msg_type == "created_workflow_task":
+                ret = worker_handler(header, msg, None, handler_kwargs, logger=self.logger)
+                if ret:
+                    self.cache_idds_ids(msg, ret)
+            elif msg_type in ("run_end", "end_run", "run_stop"):
+                idds_ids = self.get_idds_ids_from_cache(msg)
+                worker_handler(header, msg, idds_ids, handler_kwargs, logger=self.logger)
+            elif msg_type == "slice_result":
+                idds_ids = self.get_idds_ids_from_cache(msg)
+                worker_handler(header, msg, idds_ids, handler_kwargs, logger=self.logger)
+            elif msg_type == "transformer_heartbeat":
+                worker_handler(header, msg, None, handler_kwargs, logger=self.logger)
+            else:
+                self.logger.warning(f"Unknown msg_type: {msg_type}")
+        except Exception as error:
+            self.logger.critical(
+                f"on_message exception for msg_type={msg_type}: {error}\n{traceback.format_exc()}"
+            )
+
+    def _run_worker(self):
+        """
+        Connect publishers and subscriber, then monitor them until stopped.
+        Intended to run in a dedicated thread; restarts from run() on unexpected exit.
+        """
+        self.logger.info("Worker thread starting")
+
+        transformer_broadcaster = None
+        worker_subscriber = None
+        idds_workflow_publisher = None
+
+        try:
+            if self.transformer_broadcast_broker:
+                transformer_broadcaster = Publisher(
+                    name="TransformerBroadcaster",
+                    namespace=self.namespace,
+                    broker=self.transformer_broadcast_broker,
+                    broadcast=True,
+                    logger=self.logger,
+                )
+            if self.idds_workflow_publisher_broker:
+                idds_workflow_publisher = Publisher(
+                    name="IDDSWorkflowPublisher",
+                    namespace=self.namespace,
+                    broker=self.idds_workflow_publisher_broker,
+                    logger=self.logger,
+                )
+
+            panda_client = PandaClient() if self.mode == "rest" else None
+
+            handler_kwargs = {
+                "transformer_broadcaster": transformer_broadcaster,
+                "idds_workflow_publisher": idds_workflow_publisher,
+                "panda_attributes": self.panda_attributes,
+                "timetolive": self.timetolive,
+                "slice_config": self.slice_config,
+                "core_count_cache": self.run_to_core_count_cache,
+                "mode": self.mode,
+                "panda_client": panda_client,
+            }
+
+            if self.worker_subscriber_broker:
+                worker_subscriber = Subscriber(
+                    name="WorkerSubscriber",
+                    namespace=self.namespace,
+                    broker=self.worker_subscriber_broker,
+                    handler=self.on_message,
+                    handler_kwargs=handler_kwargs,
+                    logger=self.logger,
+                )
+
+            while not self.graceful_stop.is_set():
+                try:
+                    if transformer_broadcaster:
+                        transformer_broadcaster.monitor()
+                    if idds_workflow_publisher:
+                        idds_workflow_publisher.monitor()
+                    if worker_subscriber:
+                        worker_subscriber.monitor()
+                    self.graceful_stop.wait(1)
+                except Exception as error:
+                    self.logger.critical(
+                        "Worker monitor exception: %s\n%s"
+                        % (str(error), traceback.format_exc())
+                    )
+        except Exception as error:
+            self.logger.critical(
+                "Worker setup exception: %s\n%s" % (str(error), traceback.format_exc())
+            )
+        finally:
+            if transformer_broadcaster:
+                transformer_broadcaster.stop()
+            if idds_workflow_publisher:
+                idds_workflow_publisher.stop()
+            if worker_subscriber:
+                worker_subscriber.stop()
+            self.logger.info("Worker thread stopped")
+
+    def stop(self):
+        """Signal the agent to stop."""
+        self.logger.info("Stop requested")
+        self.graceful_stop.set()
+
+    def run(self):
+        """
+        Start the agent. Launches _run_worker in a supervised thread and
+        blocks until stopped (SIGTERM / SIGINT / stop()).
+        """
+        self.logger.info("Transceiver starting (namespace=%s)", self.namespace)
+
+        def _supervised():
+            while not self.graceful_stop.is_set():
+                try:
+                    self._run_worker()
+                except Exception as error:
+                    self.logger.critical(
+                        "Worker thread crashed: %s\n%s"
+                        % (str(error), traceback.format_exc())
+                    )
+                if not self.graceful_stop.is_set():
+                    self.logger.info("Restarting worker thread in 5s …")
+                    self.graceful_stop.wait(5)
+
+        worker_thread = threading.Thread(target=_supervised, daemon=True, name="TransceiverWorker")
+        worker_thread.start()
+
+        try:
+            while not self.graceful_stop.is_set():
+                self.graceful_stop.wait(timeout=60)
+        except KeyboardInterrupt:
+            self.stop()
+
+        worker_thread.join(timeout=15)
+        self.logger.info("Transceiver stopped")
+
+
+def main():
+    """Entry point: ``swf-panda-workers`` CLI command."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="SWF Panda Workers — transceiver agent",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument(
+        "--config", metavar="PATH",
+        help="Path to swf_panda_workers.yaml (overrides default search path)",
+    )
+    parser.add_argument(
+        "--log-level", default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+    )
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s %(name)-30s %(levelname)-8s %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+    )
+
+    cfg = load_config(args.config)
+    t_cfg = cfg.get("transceiver", {})
+    b_cfg = cfg.get("brokers", {})
+    p_cfg = cfg.get("panda", {})
+    s_cfg = cfg.get("slice", {})
+
+    agent = Transceiver(
+        namespace=t_cfg.get("namespace", "dev"),
+        num_threads=t_cfg.get("num_threads", 8),
+        timetolive=t_cfg.get("timetolive", 12 * 3600 * 1000),
+        transformer_broadcast_broker=b_cfg.get("transformer_broadcast"),
+        worker_subscriber_broker=b_cfg.get("worker_subscriber"),
+        idds_workflow_publisher_broker=b_cfg.get("idds_workflow_publisher"),
+        panda_attributes=p_cfg or {},
+        slice_config=s_cfg or {},
+        mode=t_cfg.get("mode", "message"),
+    )
+
+    def _handle_signal(signum, _):
+        logger.info("Received signal %d, shutting down …", signum)
+        agent.stop()
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
+    agent.run()
+
+
+if __name__ == "__main__":
+    main()

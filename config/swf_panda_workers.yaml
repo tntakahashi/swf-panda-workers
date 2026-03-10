@@ -1,0 +1,139 @@
+# SWF Panda Workers – configuration file
+#
+# Env-var substitution (${VAR}) is supported.
+
+# ---------------------------------------------------------------------------
+# Transceiver agent settings
+# ---------------------------------------------------------------------------
+transceiver:
+  # Deployment namespace – injected as `instance` in every message header.
+  # Typical values: "prod", "dev", "dev_<userid>"
+  namespace: dev
+
+  # Number of worker threads spawned by the Transceiver agent
+  num_threads: 8
+
+  # Default message time-to-live (milliseconds).  12 hours = 43_200_000 ms.
+  timetolive: 43200000   # 12 * 3600 * 1000
+
+  # Transceiver mode – controls how outbound iDDS calls are made.
+  #   message  – publish STOMP messages to /topic/idds.workflow (default)
+  #   rest     – call iDDS REST API directly via PandaClient
+  mode: message
+
+# ---------------------------------------------------------------------------
+# Broker configurations
+#
+# Each broker block is passed as a dict to the Publisher / Subscriber classes
+# in brokers/activemq.py.
+#
+# Shared STOMP fields:
+#   host          – broker hostname or IP
+#   port          – STOMP port (default ActiveMQ: 61613)
+#   username      – broker username (or leave blank for no-auth)
+#   password      – broker password
+#   destination   – topic or queue address
+#   use_ssl       – enable TLS (true/false)
+#   ssl_key_file  – path to client private key (PEM)
+#   ssl_cert_file – path to client certificate (PEM)
+#   ssl_ca_certs  – path to CA bundle (PEM)
+#   selector      – optional broker-side STOMP selector expression
+#   prefetch_size – activemq.prefetchSize for subscribers (default: 1)
+# ---------------------------------------------------------------------------
+brokers:
+  # Subscriber: receives run_imminent / end_run / created_workflow_task messages
+  worker_subscriber:
+    host: localhost
+    port: 61613
+    destination: /topic/panda.workers
+    username: admin
+    password: admin
+    use_ssl: false
+    prefetch_size: 1
+
+  # Publisher: broadcasts stop_transformer to transformers
+  transformer_broadcast:
+    host: localhost
+    port: 61613
+    destination: /topic/panda.transformer
+    username: admin
+    password: admin
+    use_ssl: false
+
+  # Publisher: sends create_workflow_task / adjust_worker messages to iDDS
+  idds_workflow_publisher:
+    host: localhost
+    port: 61613
+    destination: /topic/idds.workflow
+    username: admin
+    password: admin
+    use_ssl: false
+
+# ---------------------------------------------------------------------------
+# PanDA task parameters
+#
+# All keys here are forwarded verbatim into `panda_attributes` and used by
+# iDDS when building the PanDA task.
+# ---------------------------------------------------------------------------
+panda:
+  # Virtual organisation (taskParam: vo)
+  vo: wlcg
+
+  # PanDA queue name – maps to taskParam["site"] (the scheduling queue)
+  queue: ~                  # e.g. "BNL_OSG_2"
+
+  # Physical site – maps to taskParam["PandaSite"]
+  site: ~                   # e.g. "BNL_ATLAS_2"
+
+  # Cloud / region – maps to taskParam["cloud"]
+  cloud: ~                  # e.g. "US"
+
+  # Working group – maps to taskParam["workingGroup"]
+  working_group: ~          # e.g. "EIC"
+
+  # Task scheduling priority (higher = more urgent)
+  priority: 900
+
+  # ---- Resource requirements ----
+
+  # CPU cores per job (taskParam: coreCount / maxCpuCount)
+  core_count: 1
+
+  # RAM per core in MB (taskParam: ramCount).
+  # ramUnit is hardcoded to "MBPerCoreFixed" in the code.
+  ram_count: 4000
+
+  # Default number of PanDA jobs / workers to create per run
+  num_workers: 1
+
+  # ---- Job limits ----
+
+  # Maximum wall-clock time per job in seconds (taskParam: maxWalltime)
+  max_walltime: 3600        # 1 hour
+
+  # Maximum number of retries before a job is declared failed
+  # (taskParam: maxFailure / maxAttempt)
+  max_attempt: 3
+
+  # Seconds a transformer worker waits for a new slice before exiting
+  idle_timeout: 120
+
+  # Username submitted with the PanDA task (taskParam: userName)
+  username: iDDS
+
+  # Internal task type tag (taskParam: taskType)
+  task_type: iDDS
+
+  # Processing type (taskParam: processingType).
+  # Set to null (~) to let the scheduler decide; override when required by the site.
+  processing_type: ~        # e.g. "urgent", "express"
+
+# ---------------------------------------------------------------------------
+# Slice processing settings
+# ---------------------------------------------------------------------------
+slice:
+  # Expected processing time per slice in seconds.
+  # If a slice_result reports a processing_time that exceeds this threshold
+  # by 20 % or more, workers are scaled up by 20 %.
+  # If the excess is 50 % or more, workers are scaled up by 50 %.
+  processing_time: 30       # seconds

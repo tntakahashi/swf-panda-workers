@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "swf-panda-workers"
+version = "0.1.0"
+description = "SWF Panda Workers — transceiver agent for EIC workflow management"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+dependencies = [
+    "cachetools",
+    "pyyaml",
+    "stomp.py",
+]
+
+[project.scripts]
+swf-panda-workers = "swf_panda_workers.transceiver:main"
+
+[tool.setuptools]
+package-dir = {"" = "lib"}
+
+[tool.setuptools.packages.find]
+where = ["lib"]
+
+[tool.setuptools.data-files]
+"etc/swf_panda_workers" = ["config/swf_panda_workers.yaml"]

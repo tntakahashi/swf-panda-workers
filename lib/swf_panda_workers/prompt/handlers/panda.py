@@ -13,8 +13,6 @@ import traceback
 
 import configparser as ConfigParser
 
-from idds.common.constants import ProcessingStatus
-
 
 class PandaClient(object):
 
@@ -99,139 +97,125 @@ class PandaClient(object):
                 self.panda_config_root = panda_config.get("panda", "panda_config_root")
                 os.environ["PANDA_CONFIG_ROOT"] = self.panda_config_root
 
-    def submit(self, task_params, logger=None, log_prefix="", parent_workload_id=None):
-        from pandaclient import Client
+    def get_idds_server(self):
+        panda_config = self.load_panda_config()
+        if "IDDS_SERVER" in os.environ:
+            return os.environ["IDDS_SERVER"]
+        if panda_config.has_section("panda") and panda_config.has_option("panda", "idds_server"):
+            return panda_config.get("panda", "idds_server")
+        return None
 
+    def get_idds_client(self):
+        import idds.common.utils as idds_utils
+        import pandaclient.idds_api as idds_api
+
+        idds_server = self.get_idds_server()
+        client = idds_api.get_api(
+            idds_utils.json_dumps,
+            idds_host=idds_server,
+            compress=True,
+            verbose=False,
+            manager=True,
+        )
+        return client
+
+    def idds_create_workflow_task(self, workflow, content, logger=None, log_prefix=""):
+        """
+        Create an iDDS workflow and PanDA task directly via the iDDS client.
+
+        Corresponds to the 'create_workflow_task' message published by
+        publish_create_workflow_task_message().
+
+        :param workflow: Workflow dict (workflow_msg['content']['workflow'])
+        :param content: Remaining content dict (workflow_msg['content'] minus 'workflow')
+        :param logger: Optional logger
+        :param log_prefix: Log message prefix
+        """
         try:
-            parent_tid = None
-            if parent_workload_id:
-                parent_tid = parent_workload_id
-                if logger:
-                    logger.info(
-                        log_prefix + "parent_workload_id: %s" % parent_workload_id
-                    )
-            return_code = Client.insertTaskParams(
-                task_params, verbose=True, parent_tid=parent_tid
+            run_id = content.get("run_id")
+            if logger:
+                logger.info(log_prefix + f"idds_create_workflow_task: run_id={run_id}")
+            client = self.get_idds_client()
+            workflow['content'] = content
+            ret = client.create_workflow_task(workflow=workflow)
+            if logger:
+                logger.info(log_prefix + f"idds_create_workflow_task: result={ret}")
+            return ret
+        except Exception as ex:
+            if logger:
+                logger.error(log_prefix + str(ex))
+                logger.error(traceback.format_exc())
+            raise ex
+
+    def idds_adjust_worker(self, content, logger=None, log_prefix=""):
+        """
+        Adjust the worker count for an iDDS transform directly via the iDDS client.
+
+        Corresponds to the 'adjust_worker' message published by
+        publish_adjust_worker_message().
+
+        :param content: adjust_msg['content'] with run_id, request_id, transform_id,
+                        workload_id, core_count, memory_per_core, site
+        :param logger: Optional logger
+        :param log_prefix: Log message prefix
+        """
+        try:
+            run_id = content.get("run_id")
+            request_id = content.get("request_id")
+            transform_id = content.get("transform_id")
+            workload_id = content.get("workload_id")
+            if logger:
+                logger.info(
+                    log_prefix
+                    + f"idds_adjust_worker: run_id={run_id}, request_id={request_id}, "
+                    + f"transform_id={transform_id}, workload_id={workload_id}"
+                )
+            client = self.get_idds_client()
+            transform_properties = {
+                "core_count": content.get("core_count"),
+                "memory_per_core": content.get("memory_per_core"),
+                "site": content.get("site"),
+                "content": content,
+            }
+            ret = client.adjust_worker(
+                request_id=request_id,
+                transform_id=transform_id,
+                workload_id=workload_id,
+                parameters=transform_properties,
             )
-            if return_code[0] == 0 and return_code[1][0] is True:
-                try:
-                    task_id = int(return_code[1][1])
-                    return task_id
-                except Exception as ex:
-                    if logger:
-                        logger.warn(
-                            log_prefix
-                            + "task id is not retruned: (%s) is not task id: %s"  # noqa W503
-                            % (return_code[1][1], str(ex))
-                        )
-                    if return_code[1][1] and "jediTaskID=" in return_code[1][1]:
-                        parts = return_code[1][1].split(" ")
-                        for part in parts:
-                            if "jediTaskID=" in part:
-                                task_id = int(part.split("=")[1])
-                                return task_id, None
-                    else:
-                        raise Exception(return_code)
-            else:
-                if logger:
-                    logger.warn(
-                        log_prefix
-                        + "submit_panda_task, return_code: %s"  # noqa W503
-                        % str(return_code)  # noqa W503
-                    )
-                raise Exception(return_code)
+            if logger:
+                logger.info(log_prefix + f"idds_adjust_worker: result={ret}")
+            return ret
         except Exception as ex:
             if logger:
                 logger.error(log_prefix + str(ex))
                 logger.error(traceback.format_exc())
             raise ex
 
-    def get_processing_status(self, task_status):
-        if task_status in ["registered", "defined", "assigning"]:
-            processing_status = ProcessingStatus.Submitting
-        elif task_status in [
-            "ready",
-            "scouting",
-            "scouted",
-            "prepared",
-            "topreprocess",
-            "preprocessing",
-        ]:
-            processing_status = ProcessingStatus.Submitting
-        elif task_status in ["pending"]:
-            processing_status = ProcessingStatus.Submitted
-        elif task_status in ["running", "toretry", "toincexec", "throttled"]:
-            processing_status = ProcessingStatus.Running
-        elif task_status in ["done"]:
-            processing_status = ProcessingStatus.Finished
-        elif task_status in ["finished", "paused"]:
-            # finished, finishing, waiting it to be done
-            processing_status = ProcessingStatus.SubFinished
-        elif task_status in ["failed", "exhausted"]:
-            # aborting, tobroken
-            processing_status = ProcessingStatus.Failed
-        elif task_status in ["aborted"]:
-            # aborting, tobroken
-            processing_status = ProcessingStatus.Cancelled
-        elif task_status in ["broken"]:
-            processing_status = ProcessingStatus.Broken
-        else:
-            # finished, finishing, aborting, topreprocess, preprocessing, tobroken
-            # toretry, toincexec, rerefine, paused, throttled, passed
-            processing_status = ProcessingStatus.Submitted
-        return processing_status
+    def idds_close_workflow_task(self, content, logger=None, log_prefix=""):
+        """
+        Close an iDDS workflow task directly via the iDDS client.
 
-    def poll(self, workload_id, logger=None, log_prefix=""):
-        from pandaclient import Client
+        Corresponds to the 'close_workflow_task' message published by
+        publish_close_workflow_task_message().
 
+        :param content: close_msg['content'] with request_id, transform_id, workload_id
+        :param logger: Optional logger
+        :param log_prefix: Log message prefix
+        """
         try:
-            status, task_status = Client.getTaskStatus(workload_id)
-            if status == 0:
-                return self.get_processing_status(task_status)
-            else:
-                msg = "Failed to poll task %s: status: %s, task_status: %s" % (
-                    workload_id,
-                    status,
-                    task_status,
+            request_id = content.get("request_id")
+            run_id = content.get("run_id")
+            if logger:
+                logger.info(
+                    log_prefix
+                    + f"idds_close_workflow_task: run_id={run_id}, request_id={request_id}"
                 )
-                raise Exception(msg)
-        except Exception as ex:
+            client = self.get_idds_client()
+            ret = client.close_workflow_task(request_id=request_id, parameters=content)
             if logger:
-                logger.error(log_prefix + str(ex))
-                logger.error(traceback.format_exc())
-            raise ex
-
-    def close(self, workload_id, soft=False, logger=None, log_prefix=""):
-        from pandaclient import Client
-
-        try:
-            if logger:
-                logger.info(log_prefix + f"aborting task {workload_id}")
-            Client.finishTask(workload_id, soft=soft)
-            status, task_status = Client.getTaskStatus(workload_id)
-            if status == 0:
-                return self.get_processing_status(task_status)
-            else:
-                msg = "Failed to abort task %s: status: %s, task_status: %s" % (
-                    workload_id,
-                    status,
-                    task_status,
-                )
-                raise Exception(msg)
-        except Exception as ex:
-            if logger:
-                logger.error(log_prefix + str(ex))
-                logger.error(traceback.format_exc())
-            raise ex
-
-    def resume(self, workload_id, logger=None, log_prefix=""):
-        from pandaclient import Client
-
-        try:
-            if logger:
-                logger.info(log_prefix + f"resuming task {workload_id}")
-            status, out = Client.retryTask(workload_id, newParams={})
-            return ProcessingStatus.Running
+                logger.info(log_prefix + f"idds_close_workflow_task: result={ret}")
+            return ret
         except Exception as ex:
             if logger:
                 logger.error(log_prefix + str(ex))
