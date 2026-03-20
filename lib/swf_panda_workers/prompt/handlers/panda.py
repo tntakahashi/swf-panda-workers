@@ -119,24 +119,23 @@ class PandaClient(object):
         )
         return client
 
-    def idds_create_workflow_task(self, workflow, content, logger=None, log_prefix=""):
+    def idds_create_workflow_task(self, workflow, logger=None, log_prefix=""):
         """
         Create an iDDS workflow and PanDA task directly via the iDDS client.
 
-        Corresponds to the 'create_workflow_task' message published by
-        publish_create_workflow_task_message().
+        Corresponds to the 'create_workflow_task' STOMP message.
 
-        :param workflow: Workflow dict (workflow_msg['content']['workflow'])
-        :param content: Remaining content dict (workflow_msg['content'] minus 'workflow')
+        :param workflow: workflow_msg['content']['workflow'] — the full workflow dict
+                        with run/task parameters embedded in workflow['content']
         :param logger: Optional logger
         :param log_prefix: Log message prefix
         """
         try:
+            content = workflow.get("content", {})
             run_id = content.get("run_id")
             if logger:
                 logger.info(log_prefix + f"idds_create_workflow_task: run_id={run_id}")
             client = self.get_idds_client()
-            workflow['content'] = content
             ret = client.create_workflow_task(workflow=workflow)
             if logger:
                 logger.info(log_prefix + f"idds_create_workflow_task: result={ret}")
@@ -151,8 +150,7 @@ class PandaClient(object):
         """
         Adjust the worker count for an iDDS transform directly via the iDDS client.
 
-        Corresponds to the 'adjust_worker' message published by
-        publish_adjust_worker_message().
+        Corresponds to the 'adjust_worker' STOMP message.
 
         :param content: adjust_msg['content'] with run_id, request_id, transform_id,
                         workload_id, core_count, memory_per_core, site
@@ -196,8 +194,7 @@ class PandaClient(object):
         """
         Close an iDDS workflow task directly via the iDDS client.
 
-        Corresponds to the 'close_workflow_task' message published by
-        publish_close_workflow_task_message().
+        Corresponds to the 'close_workflow_task' STOMP message.
 
         :param content: close_msg['content'] with request_id, transform_id, workload_id
         :param logger: Optional logger

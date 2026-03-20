@@ -49,12 +49,6 @@ def _build_create_workflow_task_message(msg, panda_attributes, timetolive):
         "campaign_scope": f"{panda_attributes.get('campaign', '')}_{year}",
         "campaign_group": f"{panda_attributes.get('campaign', '')}_{year}_{month}",
         "campaign_tag": panda_attributes.get("campaign_tag", ""),
-    }
-
-    workflow_msg = {
-        "msg_type": "create_workflow_task",
-        "run_id": run_id,
-        "created_at": now.isoformat(),
         "content": {
             **content,
             "run_id": run_id,
@@ -63,6 +57,17 @@ def _build_create_workflow_task_message(msg, panda_attributes, timetolive):
             "memory_per_core": content.get("num_ram_per_core") or content.get("memory_per_core"),
             "site": site,
             "panda_attributes": panda_attributes,
+            "workflow": workflow,
+        },
+    }
+
+    workflow_msg = {
+        "msg_type": "create_workflow_task",
+        "run_id": run_id,
+        "created_at": now.isoformat(),
+        "content": {
+            "run_id": run_id,
+            "created_at": now.isoformat(),
             "workflow": workflow,
         },
     }
@@ -145,153 +150,6 @@ def _build_close_workflow_task_message(idds_ids, run_id, timetolive):
     }
 
     return close_msg, headers
-
-
-# ---------------------------------------------------------------------------
-# Publishers
-# ---------------------------------------------------------------------------
-
-def publish_create_workflow_task_message(
-    msg,
-    idds_workflow_publisher,
-    timetolive=12 * 3600 * 1000,
-    panda_attributes={},
-    logger=None,
-):
-    """
-    Publish a 'create_workflow_task' message to /topic/idds.workflow so that
-    the iDDS agent creates the iDDS workflow and PanDA task asynchronously.
-
-    Message format:
-    {
-      'msg_type': 'create_workflow_task',
-      'run_id': <run_id>,
-      'created_at': <utcnow>,
-      'content': {
-          'run_id': ...,
-          'core_count': ...,
-          'memory_per_core': ...,
-          'site': ...,
-          'panda_attributes': {...},
-          'workflow': {
-              'scope': ...,
-              'name': ...,
-              'requester': ...,
-              'username': ...,
-              'transform_tag': ...,
-              'cloud': ...,
-              'campaign': ...,
-              'campaign_scope': ...,
-              'campaign_group': ...,
-              'campaign_tag': ...,
-          }
-      }
-    }
-    """
-    logger = logger or _logger
-    run_id = msg.get("run_id")
-    workflow_msg, headers = _build_create_workflow_task_message(msg, panda_attributes, timetolive)
-
-    if idds_workflow_publisher:
-        idds_workflow_publisher.publish(workflow_msg, headers=headers)
-        if logger:
-            logger.info(
-                f"Published create_workflow_task to /topic/idds.workflow for run_id={run_id}"
-            )
-    else:
-        if logger:
-            logger.error(
-                f"idds_workflow_publisher not available; "
-                f"cannot send create_workflow_task for run_id={run_id}"
-            )
-
-
-def publish_adjust_worker_message(
-    msg,
-    idds_workflow_publisher,
-    idds_ids=None,
-    timetolive=12 * 3600 * 1000,
-    logger=None,
-):
-    """
-    Publish an 'adjust_worker' message to /topic/idds.workflow.
-
-    Message format:
-    {
-      'msg_type': 'adjust_worker',
-      'run_id': <run_id>,
-      'created_at': <utcnow>,
-      'content': {
-          'run_id': ...,
-          'created_at': ...,
-          'request_id': ...,
-          'transform_id': ...,
-          'workload_id': ...,
-          'core_count': ...,
-          'memory_per_core': ...,
-          'site': ...,
-      }
-    }
-    """
-    logger = logger or _logger
-    run_id = msg.get("run_id")
-    adjust_msg, headers = _build_adjust_worker_message(msg, idds_ids, timetolive)
-
-    if idds_workflow_publisher:
-        idds_workflow_publisher.publish(adjust_msg, headers=headers)
-        if logger:
-            logger.info(
-                f"Published adjust_worker to /topic/idds.workflow for run_id={run_id}"
-            )
-    else:
-        if logger:
-            logger.error(
-                f"idds_workflow_publisher not available; "
-                f"cannot send adjust_worker for run_id={run_id}"
-            )
-
-
-def publish_close_workflow_task_message(
-    idds_ids,
-    idds_workflow_publisher,
-    run_id=None,
-    timetolive=12 * 3600 * 1000,
-    logger=None,
-):
-    """
-    Publish a 'close_workflow_task' message to /topic/idds.workflow so that
-    the iDDS agent closes the workflow and PanDA task.
-
-    Message format:
-    {
-      'msg_type': 'close_workflow_task',
-      'run_id': <run_id>,
-      'created_at': <utcnow>,
-      'content': {
-          'request_id': ...,
-          'transform_id': ...,
-          'workload_id': ...,
-      }
-    }
-    """
-    logger = logger or _logger
-    close_msg, headers = _build_close_workflow_task_message(idds_ids, run_id, timetolive)
-
-    if idds_workflow_publisher:
-        idds_workflow_publisher.publish(close_msg, headers=headers)
-        if logger:
-            logger.info(
-                f"Published close_workflow_task to /topic/idds.workflow for run_id={run_id}, "
-                f"request_id={close_msg['content'].get('request_id')}, "
-                f"transform_id={close_msg['content'].get('transform_id')}, "
-                f"workload_id={close_msg['content'].get('workload_id')}"
-            )
-    else:
-        if logger:
-            logger.error(
-                f"idds_workflow_publisher not available; "
-                f"cannot send close_workflow_task for run_id={run_id}"
-            )
 
 
 # ---------------------------------------------------------------------------
@@ -428,8 +286,7 @@ def worker_handler(_header, msg, idds_ids=None, handler_kwargs={}, logger=None):
             else:
                 content = workflow_msg["content"]
                 workflow = content["workflow"]
-                rest_content = {k: v for k, v in content.items() if k != "workflow"}
-                panda_client.idds_create_workflow_task(workflow, rest_content, logger=logger)
+                panda_client.idds_create_workflow_task(workflow, logger=logger)
             logger.info(f"Handled run_imminent: run_id={run_id}")
 
         elif msg_type == "created_workflow_task":
