@@ -55,6 +55,7 @@ subscriber.stop()
 
 import json
 import logging
+import os
 import threading
 import time
 import traceback
@@ -63,6 +64,10 @@ import stomp
 
 logger = logging.getLogger(__name__)
 
+if os.environ.get("STOMP_DEBUG") in ("1", "true", "True"):
+    logging.getLogger("stomp").setLevel(logging.DEBUG)
+else:
+    logging.getLogger("stomp").setLevel(logging.CRITICAL)
 
 # ---------------------------------------------------------------------------
 # Internal STOMP listener
@@ -128,7 +133,15 @@ def _build_connection(broker: dict, listener=None, log=None):
     password = broker.get("password", "")
     use_ssl = broker.get("use_ssl", False)
 
-    conn = stomp.Connection([(host, port)])
+    conn = stomp.Connection12(
+        host_and_ports=[(host, port)],
+        keepalive=True,
+        try_loopback_connect=False,
+        auto_content_length=False,
+        # Shorter heartbeats (ms) so client/broker detect dead peers faster
+        heartbeats=(50000, 50000),
+        # timeout=broker_timeout,
+    )
 
     if use_ssl:
         conn.set_ssl(
