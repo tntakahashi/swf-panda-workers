@@ -60,11 +60,21 @@ brokers:
     password: admin
     use_ssl: false
 
-  # Publisher: sends create_workflow_task / adjust_worker messages to iDDS
-  idds_workflow_publisher:
+  # Subscriber: receives slice_result messages for worker scaling decisions
+  slice_result_subscriber:
     host: localhost
     port: 61613
-    destination: /topic/idds.workflow
+    destination: /queue/panda.results.worker
+    username: admin
+    password: admin
+    use_ssl: false
+    prefetch_size: 1
+
+  # Publisher: sends create_workflow_task / adjust_worker / close_workflow_task messages
+  panda_workers_publisher:
+    host: localhost
+    port: 61613
+    destination: /topic/panda.workers
     username: admin
     password: admin
     use_ssl: false
@@ -127,6 +137,14 @@ panda:
   # Processing type (taskParam: processingType).
   # Set to null (~) to let the scheduler decide; override when required by the site.
   processing_type: ~        # e.g. "urgent", "express"
+
+# ---------------------------------------------------------------------------
+# Persistent cache settings
+# ---------------------------------------------------------------------------
+cache:
+  # Path to the SQLite database file used to persist run caches across restarts.
+  # ${HOME} and other env-var placeholders are expanded at load time.
+  path: ${HOME}/.cache/swf_panda_workers/cache.db
 
 # ---------------------------------------------------------------------------
 # Slice processing settings

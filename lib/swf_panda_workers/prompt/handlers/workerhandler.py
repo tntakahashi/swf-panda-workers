@@ -6,7 +6,7 @@
 # http://www.apache.org/licenses/LICENSE-2.0OA
 #
 # Authors:
-# - Wen Guan, <wen.guan@cern.ch>, 2025
+# - Wen Guan, <wen.guan@cern.ch>, 2026
 
 
 import datetime
@@ -208,16 +208,16 @@ def handle_slice_result(msg, idds_ids, handler_kwargs, timetolive, logger):
     }
 
     mode = handler_kwargs.get("mode", "message")
-    idds_workflow_publisher = handler_kwargs.get("idds_workflow_publisher")
+    panda_workers_publisher = handler_kwargs.get("panda_workers_publisher")
     panda_client = handler_kwargs.get("panda_client")
 
     adjust_msg, headers = _build_adjust_worker_message(adjusted_msg, idds_ids, timetolive)
     if mode == "message":
-        if idds_workflow_publisher:
-            idds_workflow_publisher.publish(adjust_msg, headers=headers)
+        if panda_workers_publisher:
+            panda_workers_publisher.publish(adjust_msg, headers=headers)
         else:
             logger.error(
-                f"idds_workflow_publisher not available; "
+                f"panda_workers_publisher not available; "
                 f"cannot send adjust_worker for run_id={run_id}"
             )
     else:
@@ -235,8 +235,8 @@ def worker_handler(_header, msg, idds_ids=None, handler_kwargs={}, logger=None):
     Handle worker-related messages.
 
     Supported message types:
-    - run_imminent: Publish create_workflow_task to /topic/idds.workflow
-    - created_workflow_task: Return iDDS IDs; publish adjust_worker to /topic/idds.workflow
+    - run_imminent: Publish create_workflow_task to /topic/panda.workers
+    - created_workflow_task: Return iDDS IDs; publish adjust_worker to /topic/panda.workers
     - run_end/run_stop/end_run: Broadcast stop to transformers; publish close_workflow_task
     - slice_result: Scale up workers if processing_time exceeds threshold
     - transformer_heartbeat: Track transformer health
@@ -256,7 +256,7 @@ def worker_handler(_header, msg, idds_ids=None, handler_kwargs={}, logger=None):
     panda_attributes = {}
 
     transformer_broadcaster = handler_kwargs.get("transformer_broadcaster", None)
-    idds_workflow_publisher = handler_kwargs.get("idds_workflow_publisher", None)
+    panda_workers_publisher = handler_kwargs.get("panda_workers_publisher", None)
     timetolive = handler_kwargs.get("timetolive", timetolive)
     panda_attributes = handler_kwargs.get("panda_attributes", panda_attributes)
     mode = handler_kwargs.get("mode", "message")
@@ -273,14 +273,14 @@ def worker_handler(_header, msg, idds_ids=None, handler_kwargs={}, logger=None):
                 msg, panda_attributes, timetolive
             )
             if mode == "message":
-                if idds_workflow_publisher:
-                    idds_workflow_publisher.publish(workflow_msg, headers=headers)
+                if panda_workers_publisher:
+                    panda_workers_publisher.publish(workflow_msg, headers=headers)
                     logger.info(
-                        f"Published create_workflow_task to /topic/idds.workflow for run_id={run_id}"
+                        f"Published create_workflow_task to /topic/panda.workers for run_id={run_id}"
                     )
                 else:
                     logger.error(
-                        f"idds_workflow_publisher not available; "
+                        f"panda_workers_publisher not available; "
                         f"cannot send create_workflow_task for run_id={run_id}"
                     )
             else:
@@ -326,14 +326,14 @@ def worker_handler(_header, msg, idds_ids=None, handler_kwargs={}, logger=None):
 
             close_msg, headers = _build_close_workflow_task_message(idds_ids, run_id, timetolive)
             if mode == "message":
-                if idds_workflow_publisher:
-                    idds_workflow_publisher.publish(close_msg, headers=headers)
+                if panda_workers_publisher:
+                    panda_workers_publisher.publish(close_msg, headers=headers)
                     logger.info(
-                        f"Published close_workflow_task to /topic/idds.workflow for run_id={run_id}"
+                        f"Published close_workflow_task to /topic/panda.workers for run_id={run_id}"
                     )
                 else:
                     logger.error(
-                        f"idds_workflow_publisher not available; "
+                        f"panda_workers_publisher not available; "
                         f"cannot send close_workflow_task for run_id={run_id}"
                     )
             else:

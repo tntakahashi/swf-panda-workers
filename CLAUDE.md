@@ -18,6 +18,8 @@ lib/swf_panda_workers/
   prompt/handlers/
     workerhandler.py              # Message handlers + publish helpers (create/adjust/close)
     panda.py                      # PandaClient: iDDS REST API wrappers
+  utils/
+    cache.py                      # PersistentTTLCache: SQLite-backed TTL cache
 pyproject.toml                    # Build config; install with `pip install -e .`
 ```
 
@@ -29,7 +31,7 @@ Two mutually exclusive modes — anything else raises `ValueError` at startup:
 
 | Mode | Outbound iDDS calls |
 |------|-------------------|
-| `message` | Publishes STOMP messages to `/topic/idds.workflow` |
+| `message` | Publishes STOMP messages to `/topic/panda.workers` |
 | `rest` | Calls iDDS REST API directly via `PandaClient` |
 
 Mode is validated once in `Transceiver.__init__` and again defensively in `worker_handler`. `panda_client` is instantiated only in `rest` mode and passed through `handler_kwargs`.
@@ -37,14 +39,19 @@ Mode is validated once in `Transceiver.__init__` and again defensively in `worke
 ### Message flow
 
 ```
-run_imminent       → create_workflow_task  (message: STOMP | rest: PandaClient.idds_create_workflow_task)
-created_workflow_task → cache run_id → {request_id, transform_id, workload_id}
-slice_result       → adjust_worker         (message: STOMP | rest: PandaClient.idds_adjust_worker)
-run_end/run_stop/end_run → stop_transformer broadcast + close_workflow_task
-                                           (message: STOMP | rest: PandaClient.idds_close_workflow_task)
+run_imminent            → create_workflow_task to /topic/panda.workers  (message mode)
+                          or PandaClient.idds_create_workflow_task       (rest mode)
+created_workflow_task   → cache run_id → {request_id, transform_id, workload_id}
+slice_result            → adjust_worker to /topic/panda.workers          (message mode)
+                          or PandaClient.idds_adjust_worker               (rest mode)
+run_end/run_stop/end_run → stop_transformer broadcast to /topic/panda.transformer
+                         + close_workflow_task to /topic/panda.workers   (message mode)
+                           or PandaClient.idds_close_workflow_task        (rest mode)
 ```
 
-### Caches (TTLCache, 3-day TTL, in `Transceiver`)
+### Caches (PersistentTTLCache, 3-day TTL, in `Transceiver`)
+
+Both caches are backed by SQLite (`cache.path` in yaml, default `~/.cache/swf_panda_workers/cache.db`) and survive process restarts.
 
 - `run_to_idds_ids_cache`: `run_id → {run_id, request_id, transform_id, workload_id}`
 - `run_to_core_count_cache`: `run_id → current core_count` (seeded from `run_imminent`, updated by `slice_result` scaling)
@@ -61,7 +68,7 @@ Configured via `slice.processing_time` (default 30 s):
 | Topic / Queue | Direction | Message types |
 |---|---|---|
 | `/topic/panda.workers` | inbound | `run_imminent`, `created_workflow_task`, `run_end`, `run_stop`, `end_run`, `transformer_heartbeat` |
-| `/topic/idds.workflow` | outbound | `create_workflow_task`, `adjust_worker`, `close_workflow_task` |
+| `/topic/panda.workers` | outbound (message mode) | `create_workflow_task`, `adjust_worker`, `close_workflow_task` |
 | `/topic/panda.transformer` | outbound | `stop_transformer` (broadcast) |
 | `/queue/panda.results.worker` | inbound | `slice_result` |
 
@@ -72,7 +79,7 @@ Passed from `Transceiver._run_worker` into every `worker_handler` call:
 | Key | Type | Description |
 |---|---|---|
 | `transformer_broadcaster` | `Publisher\|None` | Broadcasts `stop_transformer` |
-| `idds_workflow_publisher` | `Publisher\|None` | Publishes to `/topic/idds.workflow` (message mode) |
+| `panda_workers_publisher` | `Publisher\|None` | Publishes to `/topic/panda.workers` (message mode) |
 | `panda_attributes` | `dict` | PanDA task params forwarded from `panda:` config section |
 | `timetolive` | `int` | STOMP message TTL in ms |
 | `slice_config` | `dict` | `{processing_time: <seconds>}` |

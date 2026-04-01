@@ -6,7 +6,7 @@
 # http://www.apache.org/licenses/LICENSE-2.0OA
 #
 # Authors:
-# - Wen Guan, <wen.guan@cern.ch>, 2025
+# - Wen Guan, <wen.guan@cern.ch>, 2026
 
 """
 Prompt Transceiver Agent
@@ -33,63 +33,19 @@ Headers should contain:
 """
 
 import logging
-import os
 import signal
-import sys
 import threading
 import traceback
-
-import yaml
-from cachetools import TTLCache
 
 from .brokers.activemq import Publisher, Subscriber
 from .prompt.handlers.panda import PandaClient
 from .prompt.handlers.workerhandler import worker_handler
+from .utils.cache import PersistentTTLCache
+from .utils.config import build_transceiver_kwargs, load_config
 
 VALID_MODES = ("message", "rest")
 
 logger = logging.getLogger(__name__)
-
-_DEFAULT_CONFIG_NAME = "swf_panda_workers.yaml"
-
-
-def load_config(config_path=None):
-    """
-    Load configuration from a YAML file.
-
-    Search order (first existing file wins):
-      1. ``config_path`` argument
-      2. ``$SWF_PANDA_WORKERS_CONFIG`` environment variable
-      3. ``~/.config/swf_panda_workers/swf_panda_workers.yaml``
-      4. ``$PREFIX/etc/swf_panda_workers/swf_panda_workers.yaml``  (installed)
-      5. ``<repo>/config/swf_panda_workers.yaml``                  (development)
-
-    ``${VAR}`` placeholders in the file are expanded via :func:`os.path.expandvars`.
-    """
-    candidates = [
-        config_path,
-        os.environ.get("SWF_PANDA_WORKERS_CONFIG"),
-        os.path.expanduser(f"~/.config/swf_panda_workers/{_DEFAULT_CONFIG_NAME}"),
-        os.path.join(sys.prefix, "etc", "swf_panda_workers", _DEFAULT_CONFIG_NAME),
-        os.path.join(os.path.dirname(__file__), "..", "..", "config", _DEFAULT_CONFIG_NAME),
-    ]
-
-    resolved = None
-    for candidate in candidates:
-        if candidate and os.path.isfile(candidate):
-            resolved = os.path.abspath(candidate)
-            break
-
-    if resolved is None:
-        raise FileNotFoundError(
-            f"Config file '{_DEFAULT_CONFIG_NAME}' not found. "
-            f"Set SWF_PANDA_WORKERS_CONFIG or pass --config."
-        )
-
-    logger.info(f"Loading config from {resolved}")
-    with open(resolved) as fh:
-        content = os.path.expandvars(fh.read())
-    return yaml.safe_load(content)
 
 
 class Transceiver:
@@ -98,17 +54,17 @@ class Transceiver:
 
     Receives workflow management messages on /topic/panda.workers and
     coordinates workflow creation, worker scaling, and transformer lifecycle
-    via /topic/idds.workflow and /topic/panda.transformer.
+    via /topic/panda.workers and /topic/panda.transformer.
 
     Message flow:
       a. EIC          -> 'run_imminent'          -> /topic/panda.workers
-      b. Transceiver  -> 'create_workflow_task'  -> /topic/idds.workflow
+      b. Transceiver  -> 'create_workflow_task'  -> /topic/panda.workers
       c. iDDS         -> 'created_workflow_task' -> /topic/panda.workers
-      d. Transceiver  -> 'adjust_worker'         -> /topic/idds.workflow
+      d. Transceiver  -> 'adjust_worker'         -> /topic/panda.workers
       e. Transformer  -> 'transformer_heartbeat' -> /topic/panda.workers
       f. EIC          -> 'run_end'               -> /topic/panda.workers
       g. Transceiver  -> 'stop_transformer'      -> /topic/panda.transformer  (broadcast)
-      h. Transceiver  -> 'adjust_worker' (0)     -> /topic/idds.workflow
+      h. Transceiver  -> 'close_workflow_task'   -> /topic/panda.workers
     """
 
     def __init__(
@@ -118,10 +74,12 @@ class Transceiver:
         timetolive=12 * 3600 * 1000,
         transformer_broadcast_broker=None,
         worker_subscriber_broker=None,
-        idds_workflow_publisher_broker=None,
+        slice_result_subscriber_broker=None,
+        panda_workers_publisher_broker=None,
         panda_attributes=None,
         slice_config=None,
         mode="message",
+        cache_path=None,
     ):
         if mode not in VALID_MODES:
             raise ValueError(
@@ -133,18 +91,21 @@ class Transceiver:
         self.timetolive = timetolive
         self.transformer_broadcast_broker = transformer_broadcast_broker
         self.worker_subscriber_broker = worker_subscriber_broker
-        self.idds_workflow_publisher_broker = idds_workflow_publisher_broker
+        self.slice_result_subscriber_broker = slice_result_subscriber_broker
+        self.panda_workers_publisher_broker = panda_workers_publisher_broker
         self.panda_attributes = panda_attributes or {}
         self.slice_config = slice_config or {}
         self.mode = mode
+        self.cache_path = cache_path
 
         self.graceful_stop = threading.Event()
         self._lock = threading.RLock()
 
+        _ttl = 3600 * 24 * 3  # 3 days
         # Cache: run_id -> {run_id, request_id, transform_id, workload_id}, expiration 3 days
-        self.run_to_idds_ids_cache = TTLCache(maxsize=200, ttl=3600 * 24 * 3)
+        self.run_to_idds_ids_cache = PersistentTTLCache(cache_path, "idds_ids", ttl=_ttl)
         # Cache: run_id -> current core_count, expiration 3 days
-        self.run_to_core_count_cache = TTLCache(maxsize=200, ttl=3600 * 24 * 3)
+        self.run_to_core_count_cache = PersistentTTLCache(cache_path, "core_count", ttl=_ttl)
 
     def get_run_id(self, msg):
         """Get run_id from message."""
@@ -170,7 +131,7 @@ class Transceiver:
         Dispatch incoming messages from /topic/panda.workers.
 
         Supported message types:
-        - 'run_imminent':          publish create_workflow_task to /topic/idds.workflow
+        - 'run_imminent':          publish create_workflow_task to /topic/panda.workers
         - 'created_workflow_task': cache iDDS IDs; publish adjust_worker
         - 'run_end' / 'run_stop':  broadcast stop_transformer; publish adjust_worker (0)
         - 'transformer_heartbeat': log heartbeat
@@ -215,7 +176,8 @@ class Transceiver:
 
         transformer_broadcaster = None
         worker_subscriber = None
-        idds_workflow_publisher = None
+        slice_result_subscriber = None
+        panda_workers_publisher = None
 
         try:
             if self.transformer_broadcast_broker:
@@ -226,11 +188,11 @@ class Transceiver:
                     broadcast=True,
                     logger=self.logger,
                 )
-            if self.idds_workflow_publisher_broker:
-                idds_workflow_publisher = Publisher(
-                    name="IDDSWorkflowPublisher",
+            if self.panda_workers_publisher_broker:
+                panda_workers_publisher = Publisher(
+                    name="PandaWorkersPublisher",
                     namespace=self.namespace,
-                    broker=self.idds_workflow_publisher_broker,
+                    broker=self.panda_workers_publisher_broker,
                     logger=self.logger,
                 )
 
@@ -238,7 +200,7 @@ class Transceiver:
 
             handler_kwargs = {
                 "transformer_broadcaster": transformer_broadcaster,
-                "idds_workflow_publisher": idds_workflow_publisher,
+                "panda_workers_publisher": panda_workers_publisher,
                 "panda_attributes": self.panda_attributes,
                 "timetolive": self.timetolive,
                 "slice_config": self.slice_config,
@@ -256,15 +218,26 @@ class Transceiver:
                     handler_kwargs=handler_kwargs,
                     logger=self.logger,
                 )
+            if self.slice_result_subscriber_broker:
+                slice_result_subscriber = Subscriber(
+                    name="SliceResultSubscriber",
+                    namespace=self.namespace,
+                    broker=self.slice_result_subscriber_broker,
+                    handler=self.on_message,
+                    handler_kwargs=handler_kwargs,
+                    logger=self.logger,
+                )
 
             while not self.graceful_stop.is_set():
                 try:
                     if transformer_broadcaster:
                         transformer_broadcaster.monitor()
-                    if idds_workflow_publisher:
-                        idds_workflow_publisher.monitor()
+                    if panda_workers_publisher:
+                        panda_workers_publisher.monitor()
                     if worker_subscriber:
                         worker_subscriber.monitor()
+                    if slice_result_subscriber:
+                        slice_result_subscriber.monitor()
                     self.graceful_stop.wait(1)
                 except Exception as error:
                     self.logger.critical(
@@ -278,10 +251,12 @@ class Transceiver:
         finally:
             if transformer_broadcaster:
                 transformer_broadcaster.stop()
-            if idds_workflow_publisher:
-                idds_workflow_publisher.stop()
+            if panda_workers_publisher:
+                panda_workers_publisher.stop()
             if worker_subscriber:
                 worker_subscriber.stop()
+            if slice_result_subscriber:
+                slice_result_subscriber.stop()
             self.logger.info("Worker thread stopped")
 
     def stop(self):
@@ -347,22 +322,7 @@ def main():
     )
 
     cfg = load_config(args.config)
-    t_cfg = cfg.get("transceiver", {})
-    b_cfg = cfg.get("brokers", {})
-    p_cfg = cfg.get("panda", {})
-    s_cfg = cfg.get("slice", {})
-
-    agent = Transceiver(
-        namespace=t_cfg.get("namespace", "dev"),
-        num_threads=t_cfg.get("num_threads", 8),
-        timetolive=t_cfg.get("timetolive", 12 * 3600 * 1000),
-        transformer_broadcast_broker=b_cfg.get("transformer_broadcast"),
-        worker_subscriber_broker=b_cfg.get("worker_subscriber"),
-        idds_workflow_publisher_broker=b_cfg.get("idds_workflow_publisher"),
-        panda_attributes=p_cfg or {},
-        slice_config=s_cfg or {},
-        mode=t_cfg.get("mode", "message"),
-    )
+    agent = Transceiver(**build_transceiver_kwargs(cfg))
 
     def _handle_signal(signum, _):
         logger.info("Received signal %d, shutting down …", signum)
