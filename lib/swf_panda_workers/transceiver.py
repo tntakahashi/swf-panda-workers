@@ -145,10 +145,31 @@ class Transceiver:
             if msg_type == "run_imminent":
                 content = msg.get("content", {})
                 core_count = content.get("num_cores_per_worker") or content.get("core_count")
+                site = content.get("site") or self.panda_attributes.get("site")
                 if core_count and run_id:
-                    self.run_to_core_count_cache[run_id] = core_count
+                    # store initial and current core_count along with site so scaling uses the initial value
+                    try:
+                        self.run_to_core_count_cache[run_id] = {
+                            "initial_core_count": core_count,
+                            "current_core_count": core_count,
+                            "initial_site": site,
+                            "current_site": site,
+                        }
+                    except Exception:
+                        # fallback to storing a bare number if cache write fails
+                        self.run_to_core_count_cache[run_id] = core_count
                 worker_handler(header, msg, None, handler_kwargs, logger=self.logger)
             elif msg_type == "created_workflow_task":
+                ret = worker_handler(header, msg, None, handler_kwargs, logger=self.logger)
+                if ret:
+                    self.cache_idds_ids(msg, ret)
+            elif msg_type in ("adjusted_worker"):
+                # iDDS may send an adjusted_worker message after applying new params
+                ret = worker_handler(header, msg, None, handler_kwargs, logger=self.logger)
+                if ret:
+                    self.cache_idds_ids(msg, ret)
+            elif msg_type in ("closed_workflow_task"):
+                # iDDS may notify workflow closure
                 ret = worker_handler(header, msg, None, handler_kwargs, logger=self.logger)
                 if ret:
                     self.cache_idds_ids(msg, ret)
@@ -205,6 +226,8 @@ class Transceiver:
                 "timetolive": self.timetolive,
                 "slice_config": self.slice_config,
                 "core_count_cache": self.run_to_core_count_cache,
+                # expose the persistent id mapping cache so handlers can record idds ids
+                "run_to_idds_ids_cache": self.run_to_idds_ids_cache,
                 "mode": self.mode,
                 "panda_client": panda_client,
             }
