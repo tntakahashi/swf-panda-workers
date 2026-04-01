@@ -57,7 +57,6 @@ def _build_create_workflow_task_message(msg, panda_attributes, timetolive):
             "memory_per_core": content.get("num_ram_per_core") or content.get("memory_per_core"),
             "site": site,
             "panda_attributes": panda_attributes,
-            "workflow": workflow,
         },
     }
 

@@ -57,7 +57,6 @@ import json
 import logging
 import os
 import threading
-import time
 import traceback
 
 import stomp
@@ -72,6 +71,7 @@ else:
 # ---------------------------------------------------------------------------
 # Internal STOMP listener
 # ---------------------------------------------------------------------------
+
 
 class _MessageListener(stomp.ConnectionListener):
     """STOMP listener that dispatches received frames to a handler callable."""
