@@ -28,7 +28,6 @@ Broker configuration dict (passed as `broker` kwarg):
     "ssl_cert_file":   "...",      # optional, path to client certificate
     "ssl_ca_certs":    "...",      # optional, path to CA bundle
     "selector":  "instance='prod' AND run_id='123'",  # optional
-    "prefetch_size": 1             # optional, activemq.prefetchSize (default: 1)
 }
 
 Usage example
@@ -438,10 +437,7 @@ class Subscriber:
             )
             self._conn = _build_connection(self._broker, listener=listener, log=self._log)
 
-            sub_headers = {
-                "ack": "client-individual",
-                "activemq.prefetchSize": str(self._broker.get("prefetch_size", 1)),
-            }
+            sub_headers = {}
             selector = self._build_selector()
             if selector:
                 sub_headers["selector"] = selector
@@ -449,7 +445,7 @@ class Subscriber:
             self._conn.subscribe(
                 destination=self._destination,
                 id=self._subscription_id,
-                ack="client-individual",
+                ack="auto",
                 headers=sub_headers,
             )
             self._log.info(
