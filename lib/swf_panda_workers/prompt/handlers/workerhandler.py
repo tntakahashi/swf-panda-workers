@@ -296,7 +296,7 @@ def worker_handler(_header, msg, idds_ids=None, handler_kwargs={}, logger=None):
         )
 
     try:
-        if msg_type == "run_imminent":
+        if msg_type == "run_imminent_worker":
             workflow_msg, headers = _build_create_workflow_task_message(
                 msg, panda_attributes, timetolive
             )

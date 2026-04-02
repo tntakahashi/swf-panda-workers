@@ -241,7 +241,7 @@ class Transceiver(BaseAgent):
 
         with self.processing():
             try:
-                if msg_type == "run_imminent":
+                if msg_type == "run_imminent_worker":
                     content = msg.get("content", {})
                     core_count = content.get("num_cores_per_worker") or content.get("core_count")
                     site = content.get("site") or self.panda_attributes.get("site")
