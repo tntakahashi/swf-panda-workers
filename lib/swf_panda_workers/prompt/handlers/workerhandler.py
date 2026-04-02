@@ -36,13 +36,13 @@ def _build_create_workflow_task_message(msg, panda_attributes, timetolive):
 
     site = content.get("site") or panda_attributes.get("site", "")
     scope = panda_attributes.get("scope", f"EIC_{year}")
-    transform_tag = panda_attributes.get("transform_tag", "")
+    transform_tag = panda_attributes.get("transform_tag", "fastproc")
 
     workflow = {
         "scope": scope,
-        "name": f"{scope}_{transform_tag}_fastprocessing_{site}_{year}{month}{day}",
-        "requester": panda_attributes.get("username", ""),
-        "username": panda_attributes.get("username", ""),
+        "name": f"{scope}_{transform_tag}_{site}_{year}{month}{day}",
+        "requester": panda_attributes.get("username", "EIC"),
+        "username": panda_attributes.get("username", "EIC"),
         "transform_tag": transform_tag,
         "cloud": panda_attributes.get("cloud", ""),
         "campaign": panda_attributes.get("campaign", ""),
@@ -236,6 +236,7 @@ def handle_slice_result(msg, idds_ids, handler_kwargs, timetolive, logger):
     adjust_msg, headers = _build_adjust_worker_message(adjusted_msg, idds_ids, timetolive)
     if mode == "message":
         if panda_workers_publisher:
+            logger.info(f"Sending adjust_worker message for run_id={run_id} with headers={headers} msg={adjust_msg}")
             panda_workers_publisher.publish(adjust_msg, headers=headers)
         else:
             logger.error(
@@ -243,6 +244,7 @@ def handle_slice_result(msg, idds_ids, handler_kwargs, timetolive, logger):
                 f"cannot send adjust_worker for run_id={run_id}"
             )
     else:
+        logger.info(f"Calling iDDS adjust_worker for run_id={run_id} with content: {adjust_msg['content']}")
         panda_client.idds_adjust_worker(adjust_msg["content"], logger=logger)
 
     logger.info(
@@ -277,6 +279,8 @@ def worker_handler(_header, msg, idds_ids=None, handler_kwargs={}, logger=None):
     timetolive = 12 * 3600 * 1000
     panda_attributes = {}
 
+    logger.info(f"Received message: type={msg_type}, run_id={run_id}, headers={_header}, msg={msg}")
+
     transformer_broadcaster = handler_kwargs.get("transformer_broadcaster", None)
     panda_workers_publisher = handler_kwargs.get("panda_workers_publisher", None)
     timetolive = handler_kwargs.get("timetolive", timetolive)
@@ -300,7 +304,7 @@ def worker_handler(_header, msg, idds_ids=None, handler_kwargs={}, logger=None):
                 if panda_workers_publisher:
                     panda_workers_publisher.publish(workflow_msg, headers=headers)
                     logger.info(
-                        f"Published create_workflow_task to /topic/panda.workers for run_id={run_id}"
+                        f"Published create_workflow_task to /topic/panda.workers for run_id={run_id}, headers={headers} msg={workflow_msg}"
                     )
                 else:
                     logger.error(
@@ -312,6 +316,7 @@ def worker_handler(_header, msg, idds_ids=None, handler_kwargs={}, logger=None):
                 workflow = content["workflow"]
                 # call iDDS directly and persist returned ids when available
                 try:
+                    logger.info(f"Calling iDDS create_workflow_task for run_id={run_id} with workflow: {workflow}")
                     create_ret = panda_client.idds_create_workflow_task(
                         workflow, logger=logger
                     )
@@ -376,14 +381,14 @@ def worker_handler(_header, msg, idds_ids=None, handler_kwargs={}, logger=None):
                     "run_id": str(run_id),
                 }
                 transformer_broadcaster.publish(stop_msg, headers=stop_header)
-                logger.info(f"Sent stop_transformer broadcast for run_id={run_id}")
+                logger.info(f"Sent stop_transformer broadcast for run_id={run_id}, headers={stop_header} msg={stop_msg}")
 
             close_msg, headers = _build_close_workflow_task_message(idds_ids, run_id, timetolive)
             if mode == "message":
                 if panda_workers_publisher:
                     panda_workers_publisher.publish(close_msg, headers=headers)
                     logger.info(
-                        f"Published close_workflow_task to /topic/panda.workers for run_id={run_id}"
+                        f"Published close_workflow_task to /topic/panda.workers for run_id={run_id} with headers={headers} msg={close_msg}"
                     )
                 else:
                     logger.error(
@@ -392,6 +397,7 @@ def worker_handler(_header, msg, idds_ids=None, handler_kwargs={}, logger=None):
                     )
             else:
                 try:
+                    logger.info(f"Calling iDDS close_workflow_task for run_id={run_id} with content: {close_msg['content']}")
                     close_ret = panda_client.idds_close_workflow_task(close_msg["content"], logger=logger)
                     logger.info(f"idds_close_workflow_task returned: {close_ret}")
                     # optionally cache the closed status

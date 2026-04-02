@@ -93,16 +93,16 @@ panda:
   vo: wlcg
 
   # PanDA queue name – maps to taskParam["site"] (the scheduling queue)
-  queue: ~                  # e.g. "BNL_OSG_2"
+  queue: BNL_PanDA_1                  # e.g. "BNL_OSG_2"
 
   # Physical site – maps to taskParam["PandaSite"]
-  site: ~                   # e.g. "BNL_ATLAS_2"
+  site: BNL-OSG                   # e.g. "BNL_ATLAS_2"
 
   # Cloud / region – maps to taskParam["cloud"]
-  cloud: ~                  # e.g. "US"
+  cloud: US                 # e.g. "US"
 
   # Working group – maps to taskParam["workingGroup"]
-  working_group: ~          # e.g. "EIC"
+  working_group: EIC          # e.g. "EIC"
 
   # Task scheduling priority (higher = more urgent)
   priority: 900
@@ -132,14 +132,21 @@ panda:
   idle_timeout: 120
 
   # Username submitted with the PanDA task (taskParam: userName)
-  username: iDDS
+  username: EICFast
 
   # Internal task type tag (taskParam: taskType)
-  task_type: iDDS
+  task_type: EICFast
 
   # Processing type (taskParam: processingType).
   # Set to null (~) to let the scheduler decide; override when required by the site.
-  processing_type: ~        # e.g. "urgent", "express"
+  processing_type: EICFast        # e.g. "urgent", "express"
+
+  # transform tag
+  transform_tag: fastproc
+
+  requester: panda-worker
+  campaign: testbed
+  campaign_tag: test
 
 # ---------------------------------------------------------------------------
 # Persistent cache settings
