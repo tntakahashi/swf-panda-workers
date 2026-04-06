@@ -154,7 +154,7 @@ def _build_connection(broker: dict, listener=None, log=None):
         conn.set_listener("", listener)
 
     _log.debug(f"Connecting to STOMP broker {host}:{port}")
-    conn.connect(username, password, wait=True)
+    conn.connect(username, password, wait=True, heartbeats=(30000, 30000))
     return conn
 
 
